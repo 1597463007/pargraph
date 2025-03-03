@@ -1,11 +1,9 @@
-import dataclasses
 import functools
 import inspect
 import itertools
 import operator
 import uuid
 import warnings
-from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable, Optional, Protocol, Tuple, Union, cast, Iterator
 
