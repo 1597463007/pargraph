@@ -43,7 +43,6 @@ class Graphable(Protocol):
         """
         ...
 
-
 @dataclass
 class GraphContext:
     """
@@ -55,14 +54,18 @@ class GraphContext:
     _graph: Graph
     _target: Optional[Union[ConstKey, InputKey, NodeOutputKey]]
 
+class GraphContextProxy:
     """
-    Common magic methods
+    Proxy for GraphContext to allow for intercepting attribute access and calling
     """
+
+    def __init__(self, **kwargs):
+        self._graph_context = GraphContext(**kwargs)
 
     def __getattr__(self, item):
-        if item in {field.name for field in dataclasses.fields(self)}:
-            return getattr(self, item)
-
+        if item in {field.name for field in dataclasses.fields(self._graph_context)}:
+            return getattr(self._graph_context, item)
+        
         def _getattr(self, item) -> Any:
             return getattr(self, item)
 
@@ -71,7 +74,7 @@ class GraphContext:
 
     def __call__(self, *args, **kwargs):
         warnings.warn(
-            "Calling a GraphContext object is not recommended, please use a dedicated delayed function instead",
+            "Calling GraphContextProxy is not recommended, please use a dedicated delayed function instead",
             stacklevel=2,
         )
 
@@ -84,14 +87,13 @@ class GraphContext:
 
         return call(self, len(args), *args, *itertools.chain(*kwargs.items()))
 
-
-def external_input() -> GraphContext:
+def external_input() -> GraphContextProxy:
     """
     Create an external input
 
-    :return: GraphContext with an empty graph and no target
+    :return: GraphContextProxy with an empty graph and no target
     """
-    return GraphContext(_graph=Graph(consts={}, inputs={}, nodes={}, outputs={}), _target=None)
+    return GraphContextProxy(_graph=Graph(consts={}, inputs={}, nodes={}, outputs={}), _target=None)
 
 
 def graph(function: Callable) -> Graphable:
@@ -116,12 +118,12 @@ def graph(function: Callable) -> Graphable:
             raise ValueError("Variadic positional and/or keyword arguments are not supported")
 
     @functools.wraps(function)
-    def wrapper(*args, **kwargs) -> Union[Graph, GraphContext, Tuple[GraphContext, ...], Any]:
+    def wrapper(*args, **kwargs) -> Union[Graph, GraphContextProxy, Tuple[GraphContextProxy, ...], Any]:
         # Bind arguments to handle for positional arguments
         bound_args = inspect.signature(function).bind(*args, **kwargs)
 
-        # If all arguments are not GraphContext, compute function directly
-        if all(not isinstance(arg, GraphContext) for arg in bound_args.arguments.values()):
+        # If all arguments are not GraphContextProxy, compute function directly
+        if all(not isinstance(arg, GraphContextProxy) for arg in bound_args.arguments.values()):
             return function(*args, **kwargs)
 
         # Generate graph context
@@ -129,11 +131,11 @@ def graph(function: Callable) -> Graphable:
         graph_result = function(
             **{
                 name: (
-                    GraphContext(
+                    GraphContextProxy(
                         _graph=Graph(consts={}, inputs={InputKey(key=name): None}, nodes={}, outputs={}),
                         _target=InputKey(key=name),
                     )
-                    if isinstance(arg, GraphContext)
+                    if isinstance(arg, GraphContextProxy)
                     else arg
                 )
                 for name, arg in bound_args.arguments.items()
@@ -152,19 +154,19 @@ def graph(function: Callable) -> Graphable:
                     outputs={OutputKey(key=output_name): graph_context._target},
                 )
                 for output_name, graph_context in cast(
-                    Iterator[Tuple[str, GraphContext]],
+                    Iterator[Tuple[str, GraphContextProxy]],
                     (
                         zip(output_names, graph_result)
                         if isinstance(output_names, tuple)
                         else ((output_names, graph_result),)
                     ),
                 )
-                if isinstance(graph_context, GraphContext)
+                if isinstance(graph_context, GraphContextProxy)
             )
         )
 
         # Short circuit if external input is passed in (for top-level graph calls)
-        if any(arg._target is None for arg in bound_args.arguments.values() if isinstance(arg, GraphContext)):
+        if any(arg._target is None for arg in bound_args.arguments.values() if isinstance(arg, GraphContextProxy)):
             # Inject default values for external inputs
             for name, arg in bound_args.arguments.items():
                 default_value = bound_args.signature.parameters[name].default
@@ -180,21 +182,21 @@ def graph(function: Callable) -> Graphable:
         # Inject sub graph into parent graph
         node_id = f"{function.__name__}_{uuid.uuid4().hex}"
         parent_graph = _merge_graphs(
-            *(arg._graph for arg in bound_args.arguments.values() if isinstance(arg, GraphContext))
+            *(arg._graph for arg in bound_args.arguments.values() if isinstance(arg, GraphContextProxy))
         )
         parent_graph.nodes[NodeKey(key=node_id)] = GraphCall(
             graph=sub_graph,
             graph_name=function.__name__,
-            args={name: arg._target for name, arg in bound_args.arguments.items() if isinstance(arg, GraphContext)},
+            args={name: arg._target for name, arg in bound_args.arguments.items() if isinstance(arg, GraphContextProxy)},
         )
 
         return (
             tuple(
-                GraphContext(_graph=parent_graph, _target=NodeOutputKey(key=node_id, output=output_name))
+                GraphContextProxy(_graph=parent_graph, _target=NodeOutputKey(key=node_id, output=output_name))
                 for output_name in output_names
             )
             if isinstance(output_names, tuple)
-            else GraphContext(_graph=parent_graph, _target=NodeOutputKey(key=node_id, output=output_names))
+            else GraphContextProxy(_graph=parent_graph, _target=NodeOutputKey(key=node_id, output=output_names))
         )
 
     def to_graph(*args, **kwargs):
@@ -229,10 +231,10 @@ def delayed(function: Callable) -> Graphable:
             raise ValueError("Variadic positional arguments are only supported if no other named arguments are present")
 
     @functools.wraps(function)
-    def wrapper(*args, **kwargs) -> Union[Graph, GraphContext, Tuple[GraphContext, ...], Any]:
-        # If all arguments are not GraphContext, compute function directly
+    def wrapper(*args, **kwargs) -> Union[Graph, GraphContextProxy, Tuple[GraphContextProxy, ...], Any]:
+        # If all arguments are not GraphContextProxy, compute function directly
         # Note: cannot use bound_args because arg may be variadic
-        if all(not isinstance(arg, GraphContext) for arg in itertools.chain(args, kwargs.values())):
+        if all(not isinstance(arg, GraphContextProxy) for arg in itertools.chain(args, kwargs.values())):
             return function(*args, **kwargs)
 
         # Bind arguments to handle for positional arguments
@@ -241,13 +243,13 @@ def delayed(function: Callable) -> Graphable:
         # Handle variadic positional arguments
         if next(iter(bound_args.signature.parameters.values())).kind == inspect.Parameter.VAR_POSITIONAL:
             arg_dict = {
-                str(i): arg if isinstance(arg, GraphContext) else _create_const(arg)
+                str(i): arg if isinstance(arg, GraphContextProxy) else _create_const(arg)
                 for i, arg in enumerate(bound_args.args)
             }
         # Handle regular positional and keyword arguments
         else:
             arg_dict = {
-                name: arg if isinstance(arg, GraphContext) else _create_const(arg)
+                name: arg if isinstance(arg, GraphContextProxy) else _create_const(arg)
                 for name, arg in bound_args.arguments.items()
             }
 
@@ -298,11 +300,11 @@ def delayed(function: Callable) -> Graphable:
 
         return (
             tuple(
-                GraphContext(_graph=merged_graph, _target=NodeOutputKey(key=node_id, output=output_name))
+                GraphContextProxy(_graph=merged_graph, _target=NodeOutputKey(key=node_id, output=output_name))
                 for output_name in output_names
             )
             if isinstance(output_names, tuple)
-            else GraphContext(_graph=merged_graph, _target=NodeOutputKey(key=node_id, output=output_names))
+            else GraphContextProxy(_graph=merged_graph, _target=NodeOutputKey(key=node_id, output=output_names))
         )
 
     def to_graph(*args, **kwargs):
@@ -325,9 +327,9 @@ def _merge_graphs(*graphs: Graph) -> Graph:
     return graph
 
 
-def _create_const(value: Any) -> GraphContext:
+def _create_const(value: Any) -> GraphContextProxy:
     key = f"_{uuid.uuid4().hex}"
-    return GraphContext(
+    return GraphContextProxy(
         _graph=Graph(consts={ConstKey(key=key): Const.from_value(value)}, inputs={}, nodes={}, outputs={}),
         _target=ConstKey(key=key),
     )
@@ -392,7 +394,7 @@ for op in {
 
         return _implicit_delayed(meth)
 
-    setattr(GraphContext, f"__{op.__name__.strip('_')}__", wrapper(op))
+    setattr(GraphContextProxy, f"__{op.__name__.strip('_')}__", wrapper(op))
 
 # Register unary operators that allow an optional parameter
 for op in {round}:
@@ -406,7 +408,7 @@ for op in {round}:
 
         return _implicit_delayed(meth)
 
-    setattr(GraphContext, f"__{op.__name__.strip('_')}__", wrapper(op))
+    setattr(GraphContextProxy, f"__{op.__name__.strip('_')}__", wrapper(op))
 
 # Register binary operators, may be missing some
 for op in {
@@ -444,7 +446,7 @@ for op in {
 
         return _implicit_delayed(meth)
 
-    setattr(GraphContext, f"__{op.__name__.strip('_')}__", wrapper(op))
+    setattr(GraphContextProxy, f"__{op.__name__.strip('_')}__", wrapper(op))
 
 # Register binary operators that allow an optional parameter
 for op in {pow}:
@@ -459,7 +461,7 @@ for op in {pow}:
 
         return _implicit_delayed(meth)
 
-    setattr(GraphContext, f"__{op.__name__.strip('_')}__", wrapper(op))
+    setattr(GraphContextProxy, f"__{op.__name__.strip('_')}__", wrapper(op))
 
 # Register right-hand side binary operators, may be missing some
 for op in {
@@ -488,7 +490,7 @@ for op in {
 
         return _implicit_delayed(meth)
 
-    setattr(GraphContext, f"__r{op.__name__.strip('_')}__", wrapper(op))
+    setattr(GraphContextProxy, f"__r{op.__name__.strip('_')}__", wrapper(op))
 
 # Register right-hand side binary operators that allow an optional parameter
 for op in {pow}:
@@ -503,4 +505,4 @@ for op in {pow}:
 
         return _implicit_delayed(meth)
 
-    setattr(GraphContext, f"__r{op.__name__.strip('_')}__", wrapper(op))
+    setattr(GraphContextProxy, f"__r{op.__name__.strip('_')}__", wrapper(op))
